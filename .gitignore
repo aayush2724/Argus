@@ -1,0 +1,22 @@
+# Local environment configuration; example files can be committed.
+!.env.example
+!.env.*.example
+
+# Python environments and generated files.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node dependencies and build output.
+node_modules/
+dist/
+
+# Local coverage output.
+.coverage
+.coverage.*
+htmlcov/
+coverage/
+config.bat

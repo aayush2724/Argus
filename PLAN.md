@@ -1,299 +1,107 @@
-# Engineering Auditor — Project Plan
+# Argus — Project Plan
 
-Working name: **Argus** (rename freely; folder is `engineering-auditor`).
-Date: 2026-11-08 · Status: **locked, revision 2** (after advisor review; changes listed in Part 5)
-Owner: aayush2724
+Revision 4 · 2026-11-22 · Owner: aayush2724
 
-One line: an agentic AppSec auditor that runs deterministic scanners on a repository, then uses an
-LLM agent with **read-only, path-jailed** code tools to verify each finding with an evidence chain,
-and publishes **measured** precision, recall, MCC and cost on SastBench under conditions that are
-comparable to the published paper.
+Argus runs deterministic scanners, investigates suspicious findings with a restricted read-only LLM agent, produces evidence-backed verdicts, and evaluates triage performance using SastBench. AI-assisted SAST triage already exists. Argus will be judged on whether tool-assisted investigation improves triage enough to justify its cost and latency, and whether the system can demonstrate secure execution, reliable recovery and reproducible measurements. Publish negative and inconclusive results.
 
-The product is the triage, not the detection. Detection is a crowded market (Semgrep, Snyk,
-Corgea, Endor Labs). Noise is the unsolved problem: SastBench measures real SAST output at 8.15
-false positives per true positive, and the best published agent reaches only **MCC 0.148**.
+The repository is documentation-only today. The proposed `engineering-auditor` layout and all milestones are planned. [Progress](PROGRESS.md)
 
-**Honest positioning.** "Semgrep plus Claude to kill false positives" already exists as a toy on
-GitHub several times over, and Endor Labs ships an AI SAST-triage plugin for coding agents. None
-of them publish benchmark results. Argus is differentiated by methodology and numbers, not by the
-idea. If the numbers are bad, the write-up says so and explains why; that is still a credible
-project for the audience.
+## 1. Architecture and scope
 
----
+React, TypeScript, Vite and Tailwind CSS provide the local dashboard. Strict TypeScript, Node.js, Express, Zod and Drizzle own the REST API, job controller and PostgreSQL. The worker starts with one scan slot and a finite queue. Python 3.13+, uv, Pydantic v2, Typer, pinned Semgrep, Tree-sitter and Docker own analysis. Use pytest, Ruff and mypy for engine checks, and lightweight OpenTelemetry in both runtimes from M0. MCP over stdio uses the Python SDK.
 
-## Part 1 — Discovery
+The API stores scans and jobs atomically, returns HTTP 202, and serves persisted progress to the polling dashboard. Node claims leased jobs, runs Python through explicit versioned process contracts, and publishes findings transactionally. A restarted worker resumes from validated completed checkpoints under a new attempt. Calls interrupted before settlement may be charged and repeated, so reservations and unknown cost survive recovery. CLI, MCP and the official evaluator reuse the Python engine with file-based artifacts. [Architecture and API](docs/ARCHITECTURE.md) · [Schema and migrations](docs/DATABASE.md) · [ADR-002](docs/ADR-002-production-architecture.md)
 
-### 1.1 Problem and users
-
-| Who | Pain today | What Argus gives them |
-|---|---|---|
-| You and your OWASP chapter | Semgrep on a student repo returns dozens of findings; nobody reads them | A short report of verified issues, each with file:line evidence and why it is exploitable |
-| Any developer with a repo | Same noise, plus no time | `argus audit <repo>` locally, or the `argus` MCP tool inside Claude Code / Cursor |
-| SaaS AppSec and AI-engineering hiring teams (the write-up's audience) | Need people who can design evals and manage LLM cost | Benchmark numbers with confidence intervals, ablations, cost per verified finding, failure taxonomy, limitations |
-
-### 1.2 Hard non-goals for MVP
-
-- Not a new vulnerability detector. Scanners find; the agent verifies.
-- No autofix. Fix suggestions are text only.
-- No web dashboard. CLI, Markdown/SARIF/JSON reports, MCP server over stdio.
-- No DAST and no execution of the target repository's code, ever.
-- No GitHub Action, no hosted service, no multi-user.
-
-### 1.3 MVP boundaries
-
-**In:** repo ingest at a given commit (single-commit fetch); Semgrep OSS findings triaged by the
-agent; osv-scanner and gitleaks findings reported **untriaged** in their own sections (they cannot
-be judged by reading code); normalised `Finding` schema with SARIF in/out; triage agent with
-read-only tools and per-finding budgets; reports; SQLite run store with cost ledger and failure
-taxonomy; **SastBench agent adapter** so Argus runs inside the official evaluator; a fresh
-post-cutoff SastBench slice built with the official generator; a tiny CI regression eval; MCP
-server (stdio); write-up.
-
-**Optional if time allows (not in the plan's critical path):** OpenSSF CVE Benchmark runner
-(repo last pushed March 2024, all CVEs pre-2024 and contaminated), eyeballvul detection runs (it
-has no line-level labels; it is a detection benchmark scored by an LLM matcher), GitHub Action,
-Streamable HTTP for MCP, autofix for one CWE.
-
-### 1.4 Languages
-
-Tree-sitter symbol tools for JavaScript/TypeScript and Python. Everything else gets `read_file`,
-`grep` and `list_dir` only. SastBench spans 38 languages (mostly PHP, JS/TS, Python), so **every
-result is reported per language**, and the "with symbol tools" claim is made only for JS/TS/Python.
-
-### 1.5 External dependencies
-
-| Dependency | Role | Licence | Verified facts (2026-11-08) |
-|---|---|---|---|
-| **SastBench** `github.com/RivalSecurity/sastbench` | primary benchmark and evaluator | Apache-2.0, pushed 2026-05 | Paper arXiv 2601.02941 (Rival Security, Jan 2026). `data/sastbench-v0.1-original.json` = 2,737 findings (299 TP real CVEs, 2,438 FP from Semgrep OSS on the pre-fix commit), 8.15:1. Evaluator (`evaluation/evaluation_cli.py run --agent-dir … --dataset … --output …`) groups by `(repo_url, commit_hash)`, checks out the commit, calls the agent's `preprocess` once per commit and `analyze(processed_data_path, finding_data)` once per finding over a Dockerised REST API; agent returns `prediction ∈ {true_positive, false_positive, error}` + `confidence`. `finding_data` (`to_analyzer`) is the **same shape for both classes**: `vulnerability_type`, `vulnerability_name`, `description`, `locations[{file, function, line_start, line_end}]`, `commit_context`. Bundled agents: `oneshot_analyzer`, `simple_react_agent`, `mini_sweagent_agent`, each taking a `--model` string. `dataset_generation` builds new slices from NVD + PyDriller + Semgrep: `python -m dataset_generation.cli build-benchmark --start-date YYYY-MM --end-date YYYY-MM` (needs `semgrep`, ctags, `GITHUB_TOKEN`; default cap 300 CVEs, seed 42). Published results: Gemini 2.5 Pro MCC 0.148 / P 0.169 / R 0.582; Claude Sonnet 4.5 MCC 0.110 / P 0.140 / R 0.722 |
-| Semgrep OSS (`pip install semgrep`) | product-path SAST | LGPL CLI, free registry rules | pin the version; use `p/default`, `p/javascript`, `p/python`, `p/owasp-top-ten` |
-| osv-scanner, gitleaks | dependency CVEs, secrets | Apache-2, MIT | reported untriaged; gitleaks snippets **redacted** before any model call |
-| Docker | scanner sandbox; required by the SastBench evaluator | free | |
-| Anthropic API | triage agent | `claude-opus-5` $5/$25 per MTok (cache read ≈ $0.50); `claude-sonnet-5` $2/$10; Batch API 50% off | provider abstracted behind one interface |
-| `tree-sitter` + JS/TS/Python grammars | symbol and caller lookup | MIT | |
-| MCP Python SDK (`mcp`) | expose Argus as a tool | MIT | stdio only in MVP |
-
-### 1.6 Cost model (planning numbers; M0 spike measures the real ones)
-
-Per finding. Tool-loop input accumulates across turns; with incremental cache breakpoints most of
-it is cache reads.
-
-| Mode | Tokens | Opus 5 | Sonnet 5 |
-|---|---|---|---|
-| Single-shot (finding + function span + neighbours) | ~6k in / 1k out | $0.055 (Batch: $0.03) | $0.022 (Batch: $0.011) |
-| Tool loop, ≤ 8 turns, ~120k cumulative input of which ~85% cached | ~18k uncached + ~100k cached / 3k out | $0.25–0.45 | $0.10–0.18 |
-
-| Run | Samples | Mode | Estimate |
-|---|---|---|---|
-| Dev iteration | 150 (dev split) | Sonnet tool loop | $15–27 per run; budget 10 runs ≈ $150–270 |
-| Test, headline | 600 stratified from the test split, 3 seeds | Opus tool loop | $450–810 |
-| Test, full | all test-split samples (~2,400), 1 seed | Sonnet tool loop | $240–430 |
-| Fresh-slice contamination check | ~300 | Opus tool loop | $75–135 |
-| Paper-style baselines on same model and subset | 600 × 2 agents | Opus | ~$150–300 |
-
-Budget tiers for D2 below: **minimum credible ≈ $350** (Sonnet dev, one Opus 600-sample test run,
-one Sonnet full-test run, baselines on Sonnet); **recommended ≈ $900–1,200** (adds 3 Opus seeds and
-the fresh slice).
-
-### 1.7 Assumptions
-
-1. Solo, 6–8 weeks part-time, laptop plus Docker.
-2. Ground truth comes only from SastBench labels; spot checks are for sanity, not for scoring.
-3. The agent never executes repository code; all tools are read-only and jailed to the checkout
-   with `.git` excluded; the checkout is a single-commit fetch so later commits (including the
-   fix) are not present.
-4. The agent sees exactly the benchmark's `to_analyzer` payload plus what its tools read. It never
-   sees `source`, `ground_truth`, Semgrep rule ids, rule text or severities during benchmark runs.
-5. One primary abstention rule, fixed before any scoring: **surfaced = predicted positive**, so a
-   `needs_review` verdict counts as `true_positive` in the primary metric. The abstention rate and
-   the alternative accounting (abstain = negative) are always reported alongside.
-
-### 1.8 Risks
-
-| Risk | Mitigation |
+| Priority | Scope and rationale |
 |---|---|
-| Label leakage through asymmetric inputs | Input parity by construction (payload only). Metadata-only probe: a classifier trained on payload fields without code must score ≈ random, and the probe result is published |
-| Git-history leakage (the fix is in a later commit) | `git fetch --depth 1 <commit>`, `.git` outside the tool jail, no `git_blame` tool |
-| Contamination inflates recall on famous CVEs, not on FPs | Fresh slice built with the official generator from CVEs published after the model's cutoff; report original-slice and fresh-slice numbers separately |
-| Tuning on the test set | Repo-level dev/test split made in M0 and frozen; dev = 150 samples; test touched only at M4 and M5 |
-| Wrapper trap | M3→M4 ablation with a quantified gate (Part 3). If tools do not help, the project reports why |
-| Statistics on ~65 TPs | MCC with repo-cluster bootstrap 95% CI, PR-AUC, paired bootstrap for ablations, 3 seeds per configuration |
-| Evidence hallucination | Deterministic check that every cited file:line exists and lies in the checkout; invalid-evidence rate is a reported metric and invalidates a `true_positive` to `needs_review` |
-| Cost blow-up | Per-finding token and turn budgets, per-run cap, resumable runs with rate limiting, Batch API for single-shot sweeps, Sonnet for dev |
-| Prompt injection from repo content | Repo text as delimited untrusted data; no write or exec tools; schema-constrained output; fixture repo with injection comments in CI; flip rate reported |
-| Over-claiming or unfair comparison | Every README number cites a run id; comparisons to the paper only on matching model, agent and subset; language coverage stated |
+| P0 | Standalone Python provides reproducible execution and a smaller research dependency graph than the hybrid stack. Use one pinned Semgrep scanner for real inputs. Restricted tools and strict evidence verdicts are required to test the tool-assisted research question safely. Single-shot is the simpler baseline. |
+| P0 | Official SastBench and cost accounting support scientific and operational comparisons. Use replay and small dev subsets during development. A custom evaluator would sacrifice protocol comparability. |
+| P0 | PostgreSQL jobs and a minimal API demonstrate durable acceptance, fencing, cancellation and recovery. Use a single process manager and one slot. A CLI alone is viable for research, and cannot demonstrate the requested application lifecycle. Core tests make containment, transactions and claims verifiable. |
+| P1 | Dashboard, visual evidence chain, evaluation lab, MCP, broader adversarial suite and recovery demos. Each consumes existing contracts. Ship basic tables and drill-downs first. |
+| P2 | Redis/BullMQ, push updates, multi-user authentication, hosted deployment, GitHub Actions product integration, automatic fixes and expanded scanners. OSV-Scanner and Gitleaks retain the Revision 3 design of separate untriaged results if added. No target-code execution or DAST. |
 
-### 1.9 Decisions to confirm before M0
+Proposed directories are `apps/{api,web}`, `engine/{argus,tests}` with its own Python project, `packages/contracts` for schemas and fixtures, `benchmarks`, `fixtures`, `infrastructure` for Docker Compose and `docs`. Keep image and rules pins in version control and credentials, private datasets and generated run artifacts outside it.
 
-| # | Question | Recommended default |
-|---|---|---|
-| D1 | Symbol-tool languages | JS/TS and Python; others get file tools only |
-| D2 | Models and budget | Sonnet 5 for development on the dev split; Opus 5 for test-split headline runs and the fresh slice. Budget tier: recommended (~$900–1,200) if affordable, else minimum (~$350) |
-| D3 | Delivery surface | CLI + Markdown/SARIF/JSON + MCP over stdio; no UI, no Action |
+## 2. Agent and provider runtime
 
----
+At each finding, select the flagged span and a bounded enclosing-function window with deterministic ordering. Investigate attacker-controlled input, propagation, validation, sink, reachability, configuration and preconditions. Seek referenced symbols or callers only when they resolve a concrete gap. Start with JS/TS and Python symbol indexes. Other languages use bounded file reads, directory listing, search and manifest summaries. No whole-repository prompt. Log which retrieval policy and budgets were used. Benchmark effort depends on remaining budget and the approved payload, with scanner severity and labels excluded.
 
-## Part 2 — Architecture
+Bound tool turns, provider calls, tokens, output bytes, wall time and spend. Start with at most eight tool turns and deterministic truncation with reserved output context. Share tool-call, tool-result, model-message, error and usage types. Separate pure tool validation/dispatch from adapter encoding. Require strict evidence-first verdicts with decision, decision confidence, evidence, preconditions, CWE when known, at most 80 words of reasoning, optional textual fix direction and failure references. Use `true_positive`, `false_positive` and `needs_review`. A positive without validated citations becomes review. Insufficient or contradictory support warrants review. Evidence must reference real bounded lines in the immutable snapshot. Measure relevance and verdict correctness separately. [Threat model](docs/THREAT_MODEL.md) · [Evaluation protocol](docs/EVALUATION.md)
 
-### 2.1 Two paths through one core
+### Provider adapters
 
-```
-Product path:   argus audit <repo> [--commit SHA] [--max-findings N]
-   ingest (single-commit fetch, lang detect, size guard)
-   → scan (semgrep | osv | gitleaks, in Docker) → normalise (Finding, SARIF) → Stage 0 filters
-   → triage agent on Semgrep findings → report (md / sarif / json) ; osv + gitleaks sections untriaged
+Define a Python provider interface for generation, normalized usage and errors, and capabilities per configured provider/model. Initial adapters are Google Gemini API, Groq API and Ollama. Anthropic Claude is a future adapter. Inject configuration into the engine. Record requested and resolved model identifiers or local weights digest, exposed model version, adapter version, effective generation parameters, seed support, context limit and pricing assumptions for each run.
 
-Benchmark path: SastBench evaluator → Argus agent container (REST)
-   preprocess(repo_path): index symbols (tree-sitter), manifest summary, jail setup
-   analyze(processed, finding_data): build Finding from `to_analyzer` → triage agent → prediction
+- Track native tool calling, schema enforcement, context limits, usage counters, streaming and caching separately. Use native calls where supported. Schema-validate tool arguments before dispatch regardless of provider. Where native schema output is unavailable, parse bounded JSON and allow a bounded repair within budget. Use single-shot for models without usable tool calls unless a separately tested structured tool protocol is selected and declared as a distinct configuration. Reject unsupported experiment configurations explicitly.
+- Single-shot uses a fixed finding and deterministic bounded context policy. The tool loop uses the same verdict and evidence policy and defaults to at most eight investigation turns. Compute effort from remaining budget. Limit each finding's calls, context, aggregate input/output tokens, wall time, tool output and retry spend. Limit each run's reserved spend and token volume, including failed/retried requests. Truncate deterministically and reserve output space before sending. Never switch providers or effective modes silently.
+- Use per-provider rate limits with bounded backoff and jitter for transient failures, honoring retry hints within the deadline. Stop on permanent errors, cancellation and exhausted budgets. Keep retries metered. Cache only through supported mechanisms using a stable system prefix and record cached input separately. Batching is optional and measured as a separate configuration.
+- Estimate charges from the recorded pricing snapshot and billable token categories, then reconcile actual usage where available. Mark unreported usage or pricing unknown, distinguish measured from estimated totals, and record local inference time and optional energy separately. Preserve per-finding failure codes for budget exhaustion, turn cap, schema retry/failure, tool error, refusal, token cutoff, invalid evidence, provider throttling and timeout.
+- Prefer available free tiers during development. Verify model availability, capability, privacy/retention, quotas and pricing before use and record the verification date. Private repository code requires explicit remote-provider opt-in. Start Ollama trials with a small quantized model, short context and one inference at a time on an 8 GB laptop. Measure peak memory and latency with other services active. Expect weaker reasoning and tool adherence on complex findings. A local or fixture-backed path is available for development without paid keys.
 
-Shared: triage agent, tools, budgets, provider, SQLite ledger (runs, findings, verdicts,
-tool calls, costs, failures), OpenTelemetry spans, metrics module.
-```
+Record a dated provider/model capability matrix for native tool calling, schema enforcement, context, token/cost reporting, caching, retry limits and version resolvability. Mark each cell verified, unsupported or unknown. Qualify the model with adapter contract tests and a bounded smoke before evaluation. Benchmark single-shot, tools, providers and retrieval policies as explicit experimental conditions. No silent fallback.
 
-### 2.2 Core schema (Pydantic; `Verdict` is also the structured LLM output)
+## 3. Signature features and developer experience
 
-```python
-class Finding(BaseModel):
-    id: str; tool: Literal["semgrep", "osv", "gitleaks", "benchmark"]
-    cwe: list[str]; title: str; description: str
-    locations: list[Location]            # file, function | None, start_line, end_line
-    # product path only, never in benchmark mode:
-    rule_id: str | None = None; severity: str | None = None; snippet: str | None = None
+- **Visual evidence chain.** Render ordered citation cards linking to actual relative paths and lines. Label nodes as observed citations or explicit assumptions. Label links as observed when supported by a cited transition, inferred when derived from the analysis, or unverified. Every asserted link references evidence IDs and provenance. Leave unsupported edges absent. A plain citation list is the fallback. Investigators can inspect redacted tool summaries, verdicts, cost and usage coverage from the same view.
+- **Model Evaluation Lab.** Read stored artifact summaries showing dataset, run ID, model/version, provider, precision/recall/MCC, latency, cost and available confidence intervals. Highlight mismatched protocol fingerprints and disable head-to-head ranking when incompatible. Show undefined measures with a reason. No inference on dashboard load.
+- **Adversarial suite.** Exercise prompt injection in source/README, fake roles, misleading comments, traversal, symlinks, oversized files and malformed tools. Record denied requests, unauthorized access, invalid evidence, verdict flips and failures separately. [Test scenarios](docs/THREAT_MODEL.md)
 
-class Evidence(BaseModel):
-    file: str; start_line: int; end_line: int
-    role: Literal["source", "propagation", "sanitizer", "sink", "config", "test", "other"]
-    note: str
+Preserve `argus scan <repo>`, `argus audit <repo>`, `argus runs`, `argus show <run-id>` and `argus bench ...`. Emit Markdown, JSON and SARIF from the same validated records. CLI and benchmarks use immutable manifests and resumable file journals. Document local setup, environment variables, database, scanners, model configuration, API/UI startup, benchmarking, diagnostics and limitations in the implementation README. Verify examples in CI with fixture responses.
 
-class Verdict(BaseModel):                 # field order is deliberate: think, then decide
-    evidence: list[Evidence]
-    preconditions: list[str]
-    reasoning_summary: str                # ≤ 80 words
-    decision: Literal["true_positive", "false_positive", "needs_review"]
-    confidence: float
-    cwe: str | None
-    fix_direction: str | None             # text only
-```
+### MCP integration (M7 · P1)
 
-Post-validation in code: every `Evidence` location must exist in the checkout; a `true_positive`
-with zero valid evidence becomes `needs_review` and increments `invalid_evidence`.
+After the standalone CLI works end to end, expose the same Python engine through a local MCP server over stdio using the Python SDK. `audit_repo` accepts an approved repository, an optional revision and a bounded finding limit, and returns a structured report. `triage_finding` accepts an approved repository and a schema-validated finding, and returns a verdict with citations. Both reuse the CLI snapshot policy, read-only tool permissions, provider privacy settings and execution budgets. The server runs independently of Express and PostgreSQL. SastBench continues to use its official evaluator adapter.
 
-### 2.3 Triage agent
+Smoke-test both tools from a supported MCP client with fixture-backed responses. Confirm that valid calls return schema-valid results while disallowed paths and malformed findings fail before analysis. Reserve stdout for protocol messages and send diagnostics to stderr. Document the client setup and retain the smoke-test transcript for the M7 demo.
 
-- **Tools, all read-only, jailed to the checkout (minus `.git`), size-capped:** `read_file(path,
-  start, end)`, `grep(pattern, glob)`, `list_dir(path)`, `read_manifest()`, and for JS/TS/Python
-  `find_symbol(name)` and `callers(name)` from the tree-sitter index built in `preprocess`. No
-  shell, network, write, or git.
-- **Loop:** Anthropic Messages API, `strict` tools, hard turn cap 8, per-finding token budget,
-  structured output into `Verdict`. Effort is set by **remaining budget**, never by severity
-  (severity is absent in benchmark mode and would leak the label).
-- **Caching:** frozen system block first (persona, verdict rules, evidence rules, abstention
-  rule); then the per-finding conversation with an incremental `cache_control` breakpoint on the
-  latest turn so each turn reads the previous prefix. Cache hit rate is logged per finding; if the
-  prefix is below the model's minimum cacheable length the marker is dropped automatically.
-- **Stage 0 (product path only):** deterministic filters: test paths, vendored or generated code,
-  informational rules. Each filtered finding is recorded with its reason. Not applied in benchmark
-  mode, where the payload carries no rule metadata.
-- **Failure taxonomy** recorded per finding: `budget_exhausted`, `turn_cap`, `schema_retry`,
-  `tool_error`, `refusal`, `max_tokens`, `invalid_evidence`. Reported as rates in every run.
-- **Resumable runs:** every finding's result is written immediately; re-running a run id skips
-  completed findings; client-side rate limiting and SDK retries on 429/5xx.
+## 4. Milestones and acceptance gates
 
-### 2.4 Evaluation methodology
+M0–M4 are ordered dependencies. Run M5–M8 in presentation order. M6 measurement depends on M3 and the frozen recipe and can proceed without a web UI. M7 core integrations use M3, and the CI scoring replay uses M6 tooling. Each milestone records a runnable test or artifact and its actual outcome in PROGRESS. The default budget is USD 0 mandatory paid model or hosting spend, assuming an existing laptop. Estimate runtime, disk and retry headroom before live runs. Use mocks, a local small model or verified free tiers with hard caps. A blocked free configuration becomes a reported limitation. No fixed completion date.
 
-| Element | Rule |
+| Milestone and goal | Deliverables and dependencies | Acceptance and required tests | Risks and cost constraints | Demo evidence |
+|---|---|---|---|---|
+| M0 · Prove feasibility | Pin evaluator and generator, freeze split, scaffold projects, Compose, strict lint/type/test and CI, trace scaffolding and parity fixtures. Start here. | Five-sample official smoke, one-month generator smoke, isolated checkout and tool proof, cross-runtime schema fixtures and DB readiness. Record upstream scoring/error behavior. | Upstream drift and Docker isolation; local bandwidth and disk, no paid calls. | Evaluator log, generator checksum, split and canary test. |
+| M1 · Produce trusted scanner output | M0. Seal snapshots, pin offline Semgrep, normalize and dedupe, CLI/basic reports and product filter audit. | Known fixture results, deterministic IDs, SARIF round-trip fixture, scanner timeout and sandbox tests. Never execute target code. | Rule drift and scanner memory; local compute, no model. | Replayed fixture scan with immutable manifest. |
+| M2 · Establish a triage baseline | M1. Provider adapters, single-shot, evidence checks, usage journal and standalone official adapter. | Mock capabilities/retries and redaction tests, qualify live configs, ten-finding dev/adaptor smoke with app down, measure original single-shot dev gate. | Refusals, model changes and quotas; bounded dev sample and USD 0 paid cap. | CLI verdict, metered journal and official dev artifact. |
+| M3 · Test investigation value | M2. Restricted tools, symbol index, loop, budgets and adversarial suite. | Jail, parsing, time/budget and invalid citation tests. Retain no-flip target on the controlled fixture. Run matched dev ablation and document gate outcome before held-out scoring. | Injection and context growth; limited local/free pilot. | Citation trail, paired dev outcome and denied tool trace. |
+| M4 · Prove durable backend | M3. Drizzle schema, strict API, worker, retries, atomic ingestion and correlated traces. | Real DB validation, clean/upgrade migrations, duplicate submissions, two claimers, lease expiry, rollback, malformed/partial results, cancel/timeout/shutdown, and recovery across a more-than-once model call. Demonstrate 202 before completion. | Stale children, duplicate charges, unavailable DB; one local DB and fake model. | Kill/restart trace, SQL invariants and same-key replay. |
+| M5 · Deliver useful UI | M4. Repository management, polling, findings, chain, history and report routes. Build Evaluation Lab against fixture imports. | Browser flow starts and cancels a scan, handles failure, pagination, hostile content and evidence navigation. No model calls on reads. | Stale progress and unsafe rendering; fixture model and local stack. | Scan progress to cited evidence and compared fixture evaluations. |
+| M6 · Measure quality and reliability | M3 and frozen M0 split. Freeze held-out recipe, matched official runs and free-model comparisons, import summaries, complete recovery demonstration against M4. | Metric/error/abstention/leakage and cost tests, blinded relevance sample, artifact replay, end-to-end worker failure with no duplicated final results. | Model drift and low free-tier throughput; use small matched cohorts and disclose coverage. | Reproduced metric table, failure trace and run IDs. |
+| M7 · Make integrations usable | M3 and M6 scoring. MCP stdio, CLI polish, Markdown/JSON/SARIF, docs and CI replay. | Same jail through MCP, client smoke, fixture-backed setup, SARIF validation, fixed 20-dev replay and budget regression. | Client compatibility; local or mock execution. | Stdio client transcript and reproducible CLI-to-report demo. |
+| M8 · Publish research and demo | M6/M7. Frozen results, uncertainty, recent/post-cutoff slice, diagrams, article and measured portfolio claims. | Recompute checksums, cluster bootstrap and figures. Publish original/recent, language/CWE, limitations and negative results. Verify demo from a clean local setup. | Unknown cutoffs and sparse classes; expand only within feasible local/free capacity. | Published artifact IDs, replay recipe and recorded recovery demo. |
+
+### Release quality gates
+
+- Backend passes fault injection with real PostgreSQL. Accepted submissions survive process loss. Stale attempts cannot publish, cancellation and timeout release resources after verified cleanup, and replay produces one immutable final result.
+- Security tests detect unauthorized access and fail on a jail escape. Untrusted content cannot widen permissions. Secret canaries stay out of model payloads, artifacts and telemetry. Test the actual supported boundary and do not generalize beyond it.
+- Every surfaced finding has validated evidence or an explicit review state. Track model/usage failures including unknown charges. Evaluate like-for-like and keep engineering completion separate from research success.
+- Every published number resolves to pinned run artifacts. The held-out split remains untouched during tuning. Publish reproducibility limits, denominators and unsupported comparisons.
+
+## 5. Final architecture review
+
+| Review area | Decision and verification |
 |---|---|
-| Benchmark | SastBench v0.1 original (2,737) via the **official evaluator**, Argus packaged as an agent directory with the same Dockerfile/REST contract as `agents/oneshot_analyzer` |
-| Split | Repo-level dev/test split, seeded, frozen in M0 and committed as a file. Dev ≈ 150 findings. Test is never used to tune prompts or budgets |
-| Inputs | Exactly `to_analyzer` plus tool reads. No rule text recovery, no severity, no `source` |
-| Leakage probe | Logistic regression on payload-only features (CWE, description length, location count, language) must be ≈ random on test; result published |
-| Primary metric | MCC (as the paper). Secondary: precision, recall, F1, **PR-AUC** from `confidence`, abstention rate, invalid-evidence rate, cost per finding, **cost per surfaced true positive**, p50/p95 latency, failure-taxonomy rates |
-| Uncertainty | Bootstrap over repo clusters (95% CI); paired bootstrap for ablations; 3 seeds per configuration on the headline subset |
-| Breakdowns | Per language (with and without symbol tools) and per CWE family |
-| Like-for-like comparison | The paper's 0.148 is Gemini 2.5 Pro on all 2,737. Argus is compared to the paper only when run on the full set with the same abstention rule; otherwise the comparison is to the bundled `oneshot_analyzer` and `simple_react_agent` **run on the same model and the same subset** |
-| Contamination | Build `sastbench-v0.1-<recent months>` with the official generator from CVEs published after the model cutoff; report both slices; the gap is a headline result |
-| Baselines, every table | all-positive, all-negative, random at base rate, Argus single-shot (M3), Argus tool loop (M4), paper-style agents on same model |
-| Regression eval in CI | 20 dev findings run on Sonnet with a fixed seed; MCC and cost must stay within tolerance for a PR to pass |
+| Complexity and simpler alternatives | Two runtimes and one DB are justified by the product and portable engine. One worker module, polling and table-based graphs avoid a separate broker, worker service, live-update stack and graph store. The dashboard can be removed from a research run. |
+| Responsibility and data ownership | Node exclusively owns PostgreSQL and worker coordination. Python owns analysis. Contract parity fixtures and standalone evaluator runs demonstrate the boundary. |
+| Crashes and retries | Fenced leases, cleanup ownership, stable result keys and durable call reservations handle restarts. Kill a worker during inference and near commit. Confirm repeated external calls and unknown costs remain visible. |
+| Sandbox | The plan requires OS controls and tests, with feasibility unverified until M0. An unsupported host fails closed. Test no egress, no host access, no credential leakage and resource limits. |
+| Providers and cost | Adapters expose capability differences. Free/local execution and mocks cover development, while model availability, 8 GB capacity and throughput can limit study scope. |
+| Scientific defensibility | Official evaluator, frozen split, parity probes and matched experiments remain required. Approximate negatives, unknown cutoffs and model nondeterminism are stated limitations. |
+| User value and incremental delivery | The UI locates evidence and history and compares stored runs. The scanner and CLI are usable earlier, and a small evaluation and one local worker keep P0 realistic for one developer. |
+| Interview verification | Show an isolation canary, stale-worker and cancellation tests, exact run manifests and replayable metric tables. Use measured claims only. |
 
-### 2.5 Reports
+## 6. Revision log
 
-- `report.md`: verified Semgrep issues first, grouped by CWE, each with evidence table and
-  preconditions; `needs_review`; dismissed with one-line reasons; untriaged osv and gitleaks
-  sections; cost, tokens, model, prompt hash, run id.
-- `report.sarif`: verdict, confidence and evidence as result properties.
-- `report.json`: raw `Verdict` list plus failure taxonomy.
-- `argus runs`, `argus show <run>`: metrics tables from SQLite.
+**Rev 4 (2026-11-22).** Preserved the hybrid decision and benchmark design. Split scan state, schedulable jobs and execution attempts. Added fenced retry and cleanup, idempotent admission, private checkpoints, persisted partial telemetry and pre-dispatch reservations for at-least-once external execution. Specified normalized evaluation/failure rows and schema migration tests. Added versioned API/process details, observability, recovery tests, evidence-chain provenance and an artifact-only evaluation lab. Moved detailed architecture, data, evaluation and threats into linked documents. Introduced P0/P1/P2 priorities, milestone demo evidence and objective gates. Kept security and research gates independent. Expanded explicit evidence relevance assessment and provider qualification without changing the benchmark input or primary scoring policy.
 
-### 2.6 MCP server (stdio)
+**Rev 3 (2026-11-22).** Adopted Argus naming and the hybrid local-first stack. Added an optional React dashboard and Express REST application with PostgreSQL and Drizzle ownership. Replaced the shared SQLite ledger with API-owned relational persistence and independent file-based CLI/benchmark artifacts. Defined versioned contracts, asynchronous job submission, polling, bounded subprocess execution, fenced attempts, cancellation, recovery, partial-result handling and transactional replay. Deferred Redis/BullMQ until local processing requirements change.
 
-`argus-mcp` exposes `audit_repo(path, commit?, max_findings?)` and `triage_finding(finding_json,
-repo_path)` and returns the JSON report. Works from Claude Code or Cursor on a local repo.
+Generalized model selection from fixed Anthropic runs to Gemini, Groq and Ollama, with Anthropic optional. Replaced provider-specific caching, batching and cost assumptions with capability checks, usage records and enforceable budgets. Added OS and filesystem controls for malicious content, path escapes, process execution and resource exhaustion. Retained untriaged scanner sections, deterministic evidence checks, MCP stdio and report formats.
 
-### 2.7 Stack
-
-Python 3.13+, `uv`, Typer, Pydantic v2, `anthropic` SDK 2.x, `tree-sitter` with grammars,
-`semgrep` (pinned), `osv-scanner` and `gitleaks` in Docker, SQLAlchemy 2 on SQLite, structlog,
-OpenTelemetry SDK (console exporter; Langfuse optional), `mcp`, pytest, ruff, mypy. No Postgres,
-no queue, no UI.
-
-### 2.8 Security of the auditor itself (talking point)
-
-Threat model: a malicious repository tries to make the auditor dismiss a real vulnerability or
-exfiltrate data. Controls: read-only jailed tools without `.git`; no execution or network;
-repository text wrapped as untrusted data; schema-constrained verdicts with evidence validation;
-gitleaks hits redacted before any model call; a fixture repo with injection comments in CI and a
-reported verdict-flip rate.
-
----
-
-## Part 3 — Milestones
-
-| # | Milestone | Deliverables | Acceptance criteria (gates) |
-|---|---|---|---|
-| M0 | Scaffold + **data spike** | `uv` project, Typer CLI, SQLite + migrations, structlog, OTel spans, fixture repo (`fixtures/vuln-express`: SQLi, path traversal, sanitised look-alike, injection comment), `argus doctor`, pytest/ruff/mypy. **Spike:** clone SastBench, run its evaluator with the bundled `oneshot_analyzer` on 5 findings using the Anthropic model string, confirm the REST contract and `--model` handling; build the repo-level dev/test split file; run `build-benchmark` on a 1-month recent window to confirm the generator works | Evaluator runs end to end on 5 findings; split file committed; generator produces a slice; tests green |
-| M1 | Scanner layer (product path) | Semgrep/osv/gitleaks adapters in Docker, `Finding`, SARIF in/out, dedupe, Stage 0 filters, `report.md` without LLM, redaction | `argus scan fixtures/vuln-express` lists expected findings; gitleaks snippets redacted; run stored |
-| M2 | Benchmark adapter + metrics | Argus agent directory for the SastBench evaluator (`preprocess`, `analyze`, Dockerfile), single-commit fetch + jail, metrics module (MCC, PR-AUC, cluster bootstrap, paired bootstrap), baselines, leakage probe, cost ledger, resumable runs | `argus bench --mode all-positive` and `--mode random` reproduce expected MCC ≈ 0; leakage probe ≈ random on test; a 10-finding Argus dry run completes through the official evaluator |
-| M3 | Triage v1, single-shot | Provider, cached system prefix, `Verdict` output, evidence validation, failure taxonomy, Batch API path | On dev (150, Sonnet): MCC with CI above random **and** at least matching the bundled `oneshot_analyzer` on the same model and subset; invalid-evidence rate < 10%; injection fixture does not flip verdicts |
-| M4 | Triage v2, tool loop (**go/no-go**) | Jailed tool set, tree-sitter index in `preprocess`, turn/token budgets, budget-based effort, incremental caching, rate limiting | On dev: paired-bootstrap 95% CI of ΔMCC (v2 − v1) excludes 0, **or** v2 matches v1's MCC at ≥ 30% lower cost per finding. Otherwise the plan is revised before M5 and the write-up's thesis changes |
-| M5 | Test-set evaluation | Frozen prompts; headline 600-sample test runs (Opus, 3 seeds); full test on Sonnet; paper-style agents on same model and subset; fresh post-cutoff slice; per-language and per-CWE tables; calibration curve | README tables filled from run ids with CIs; original vs fresh slice gap reported; comparison claims match conditions |
-| M6 | MCP + report polish | `argus-mcp` over stdio, SARIF properties, Markdown polish, CI regression eval wired | Works from Claude Code on a local repo; SARIF validates; CI eval passes |
-| M7 | Write-up and demo | README with methodology, numbers, limitations, cost; blog post; OWASP chapter demo on three members' repos | Three real repos audited live; write-up published with run ids |
-
-Order is strict. M0's spike is the first thing done in the new session, because every later
-estimate depends on the evaluator and generator actually running.
-
-### Resume line template (fill from run ids)
-
-"Built Argus, an agentic SAST triage system (Semgrep → Claude agent with jailed read-only code
-tools → evidence-validated verdicts). On SastBench (2,737 real findings, 8:1 noise) reached MCC
-__ [CI __–__] vs __ for the paper-style agent on the same model and subset, at $__ per finding and
-$__ per verified true positive; post-cutoff slice MCC __. Shipped as CLI, SARIF and MCP server."
-
----
-
-## Part 4 — Kickoff for the new session
-
-Open a new Claude Code session in this folder and paste:
-
-> Read PLAN.md fully. It is the locked plan (revision 2) for Argus, an agentic SAST triage auditor.
-> Start at milestone M0 exactly as specified in Part 3, beginning with the data spike against the
-> SastBench evaluator and generator, one milestone at a time, with tests at each step, and
-> summarise at the end of each milestone (implemented, files, tests run, measured costs,
-> limitations, next). Confirm decisions D1–D3 with me only if you disagree with the defaults.
-> Keep TODO.md and PROGRESS.md. Never use the test split before M5. Record tokens and cost on
-> every model call from the first one, and never let the agent see `source`, `ground_truth`, rule
-> ids or severities in benchmark mode.
-
-Conventions carried over from the XBot build that worked well: `uv`, strict ruff and mypy from
-day one, real integration tests where the thing under test is a database or a CLI, absolute
-paths in scripts, and one commit per milestone with the summary in PROGRESS.md.
-
----
-
-## Part 5 — Revision log
+Preserved official evaluator integration, input parity, repository split, abstention mapping, benchmarks and research gates. Replaced PR-AUC from verdict confidence with an explicit positive-class score and defined error sensitivity and score coverage. Made recent-slice claims conditional on verified cutoff and comparable conditions. Moved held-out evaluation to M6 and expanded research to M8, retaining the original larger-run design subject to quotas and reproducibility. Changed the tiny live fixed-provider CI gate to deterministic replay plus a capped live smoke. Replaced the fixed timeline and paid-model estimates with staged tests, dependency gates and measured cost forecasts. Added the monorepo plan, checklist and ADR.
 
 **Rev 2 (2026-11-08, after advisor review and reading the SastBench repository).** Switched the
-SastBench harness to the official evaluator with Argus as an agent directory, which also gives
+SastBench harness to the official evaluator with SASTTrace as an agent directory, which also gives
 input parity between classes and like-for-like baselines. Removed rule-text recovery, severity-
 based effort and the `git_blame` tool (label and history leakage). Single-commit fetch with `.git`
 outside the jail. Repo-level dev/test split frozen in M0; dev on Sonnet, test on Opus. Fixed the
