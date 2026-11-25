@@ -1,0 +1,19 @@
+diff --git a/evaluation/evaluation_cli.py b/evaluation/evaluation_cli.py
+--- a/evaluation/evaluation_cli.py
++++ b/evaluation/evaluation_cli.py
+@@ -516,13 +516,8 @@ class EvaluationRunner:
+             if not utils.check_docker_compose_available():
+                 raise RuntimeError("docker-compose is not available. Please install docker-compose.")
+             
+-            # Clean up any orphaned networks from previous runs
+-            logger.info("Cleaning up orphaned Docker networks...")
+-            utils.cleanup_orphaned_docker_networks()
+-            
+-            # Clean up any existing Neo4j containers from previous runs
+-            logger.info("Cleaning up existing Neo4j containers...")
+-            utils.cleanup_neo4j_containers()
++            # Cross-run cleanup is intentionally disabled. A private daemon
++            # and external run-scoped teardown are required for smoke tests.
+             
+             # Validate docker-compose.yml
+             if not utils.validate_docker_compose(self.agent_dir / "docker-compose.yml"):
