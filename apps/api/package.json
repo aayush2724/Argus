@@ -7,9 +7,9 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "node init && tsc",
+    "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "start": "node init && node dist/index.js"
+    "start": "node dist/index.js"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
